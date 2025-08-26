@@ -10,7 +10,7 @@ from datasets import load_dataset
 from tabulate import tabulate
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-from py_unigram.pretokenize import pretokenize_corpus
+from py_unigram.pretokenize import pretokenize_corpus, SPACES_PRE_TOKENIZER_REGEX
 from py_unigram.train import train_unigram
 
 # Example sentences to compare tokenizers
@@ -224,10 +224,6 @@ def train_sentencepiece_tokenizer(texts, vocab_size=20000) -> TokenizerResult:
     return result
 
 
-SPACES_PRETOK_REGEX = r" ?\p{L}+|\s+|[^\s\p{L}]+"
-SPACES_PRETOK_PATTERN = re.compile(SPACES_PRETOK_REGEX)
-
-
 def train_pyunigram_tokenizer(texts, name="PyUnigram", *, pretokenization: str = "spaces", **kwargs) -> TokenizerResult:
     """Train and test a PyUnigram tokenizer.
 
@@ -242,7 +238,7 @@ def train_pyunigram_tokenizer(texts, name="PyUnigram", *, pretokenization: str =
 
     # Get pretokens (text chunks with frequencies)
     if pretokenization == "spaces": # add prefix space like others
-        pretokens = pretokenize_corpus([' '+t for t in texts], regex_pattern=SPACES_PRETOK_REGEX)
+        pretokens = pretokenize_corpus([' '+t for t in texts], regex_pattern=SPACES_PRE_TOKENIZER_REGEX)
     elif pretokenization == "gpt2":
         pretokens = pretokenize_corpus(texts)
     else:
@@ -441,6 +437,12 @@ def main():
     # Train and evaluate each tokenizer
     tokenizers = [
         train_pyunigram_tokenizer(texts, "* PyUnigram (spaces)", vocab_size=args.vocab_size),
+        train_pyunigram_tokenizer(
+            texts,
+            "PyUnigram spm_like (spaces)",
+            vocab_size=args.vocab_size,
+            initial_vocab_algo="spm_like",
+        ),
         train_pyunigram_tokenizer(
             texts, "PyUnigram shrink slow (spaces)", vocab_size=args.vocab_size, pruning_shrinking_factor=0.95
         ),

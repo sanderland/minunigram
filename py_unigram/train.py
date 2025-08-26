@@ -1,12 +1,12 @@
-import heapq
 import logging
 import math
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 from scipy.special import digamma
 
 from py_unigram.model import Token, UnigramModel
 from py_unigram.utils import create_logger
+from py_unigram.initial_vocab import build_initial_vocab as _build_initial_vocab
 
 
 def log_examples(logger, tokens_with_scores: list[tuple[Token, float]], score_label="score", n=5):
@@ -27,31 +27,21 @@ def make_initial_vocab(
     required_tokens: set[str],
     num_tokens: int,
     max_token_length: int = 16,
+    *,
+    algo: str = "spm_like",
 ) -> list[Token]:
-    # TODO: does it make sense to have required tokens other than length 1?
+    """Build initial vocabulary.
 
-    substring_freq = Counter()
-    for pretoken, freq in pretokens.items():
-        for i in range(len(pretoken)):  # SentencePiece uses suffix array, this is simpler but more mem intensive
-            for j in range(i + 1, min(len(pretoken) + 1, i + max_token_length + 1)):
-                substring_freq[pretoken[i:j]] += freq
-    required_tokens |= {t for t in substring_freq if len(t) == 1}
-    for token in required_tokens:
-        substring_freq[token] = max(substring_freq.get(token, 0), 1)  # Ensure required tokens are always included
-    all_tokens = [(freq * len(token), token) for token, freq in substring_freq.items()]
-
-    selected_tokens = heapq.nlargest(num_tokens, all_tokens, key=lambda item: (item[1] in required_tokens, item[0]))
-    log_sum_scores = math.log(sum(score for score, _ in selected_tokens))
-    tokens = [
-        Token(text, i, math.log(score) - log_sum_scores, required=text in required_tokens)
-        for i, (score, text) in enumerate(selected_tokens)
-    ]
-
-    logger.info(f"🌱 Selected {num_tokens:,} initial tokens from {len(all_tokens):,} candidates")
-    logger.debug(f"   ├─ Source: {len(pretokens):,} unique pretokens")
-    logger.debug(f"   └─ Max length: {max_token_length}")
-
-    return tokens
+    algo: one of {"spm_like", "hf_like", "simple"}
+    """
+    return _build_initial_vocab(
+        logger=logger,
+        pretokens=pretokens,
+        required_tokens=required_tokens,
+        num_tokens=num_tokens,
+        max_token_length=max_token_length,
+        algo=algo,
+    )
 
 
 def run_e_step(
@@ -108,14 +98,15 @@ def run_m_step(
 
         model = UnigramModel(filtered_tokens)
 
-    total_freq = sum(expected_count[t.id] for t in model.tokens)
+    # TODO: this is a bit of a hack to avoid underflow
+    total_freq = sum(max(0.5, expected_count[t.id]) for t in model.tokens)
     if dp_smoothing:  # SentencePiece-style: digamma transform with implicit alpha=0 for sparsity bias
         log_total = digamma(total_freq)
         for t in model.tokens:
-            t.log_prob = digamma(expected_count[t.id]) - log_total
+            t.log_prob = digamma(max(0.5, expected_count[t.id])) - log_total
     else:  # Standard maximum likelihood estimation
         for t in model.tokens:
-            t.log_prob = math.log(expected_count[t.id] / total_freq)
+            t.log_prob = math.log(max(0.5, expected_count[t.id]) / total_freq)
 
     return model, num_removed
 
@@ -176,6 +167,7 @@ def prune_tokens(
         defended = any(alt.id in unused_token_ids for alt in alt_path)
         candidates.append((token, loss, defended))
 
+    num_required = len(new_tokens)
     # 3. Reduce vocabulary to target_size
     candidates.sort(key=lambda x: -x[1])
     defended_tokens = []
@@ -203,12 +195,12 @@ def prune_tokens(
         unused_tokens_info = [(model.tokens_by_id[tid], token_count[tid]) for tid in unused_token_ids]
         logger.debug(f"   ├─ Dropped {len(unused_tokens_info):,} tokens not in any optimal path")
         log_examples(logger, unused_tokens_info, "count")
-    logger.debug(f"   ├─ Kept {len(new_tokens)} required tokens")
+    logger.debug(f"   ├─ Kept {num_required:,} required tokens")
     if defended_tokens:
         logger.debug(f"   ├─ Defended {len(defended_tokens):,} tokens from being removed along with their alternatives")
         log_examples(logger, defended_tokens, "loss")
 
-    logger.debug(f"   ├─ Pruned {len(pruned_tokens):,} tokens from {len(candidates):,} candidates")
+    logger.debug(f"   ├─ Pruned {len(pruned_tokens):,} tokens from {len(candidates):,}")
     if pruned_tokens:
         log_examples(logger, pruned_tokens, "loss")
     if candidates:
@@ -245,9 +237,9 @@ def finalize_tokens(
     removed_tokens = [(t, t.log_prob) for t in model.tokens if t.id not in final_tokens]
     new_model = UnigramModel(final_tokens.values())
     logger.info(f"✨ Finalizing vocabulary from {len(model.tokens):,} to target {vocab_size:,}")
-    logger.info(f"   ├─ Removed {len(removed_tokens):,} tokens")
+    logger.debug(f"   ├─ Removed {len(removed_tokens):,} tokens")
     log_examples(logger, removed_tokens, "logprob")
-    logger.info(
+    logger.debug(
         f"   └─ Kept {len(final_tokens):,} tokens with logprob range {new_model.tokens[0].log_prob:.4g} to {new_model.tokens[-1].log_prob:.4g}"
     )
 
@@ -262,6 +254,7 @@ def train_unigram(
     vocab_size: int = 8000,
     max_token_len: int = 16,
     initial_vocab_factor: int = 10,
+    initial_vocab_algo: str = "simple",
     pre_final_vocab_factor: float = 1.1,
     pruning_shrinking_factor: float = 0.75,
     m_step_dp_smoothing: bool = True,
@@ -278,6 +271,7 @@ def train_unigram(
         vocab_size: Target vocabulary size, including required tokens
         max_token_len: Maximum token length
         initial_vocab_factor: Initial vocab size is this x vocab_size
+        initial_vocab_algo: Initial vocab builder to use ("spm_like" | "hf_like" | "simple")
         pre_final_vocab_factor: Desired vocab size before finalization is this x vocab_size
         pruning_shrinking_factor: Shrink non-required part of vocab by this factor each iteration
         m_step_dp_smoothing: If True, use digamma-based sparsity for logprobs (like SentencePiece).
@@ -298,7 +292,14 @@ def train_unigram(
 
     # initialize vocab and model
     required_tokens = set(required_tokens or [])
-    vocab = make_initial_vocab(logger, pretokens, required_tokens, vocab_size * initial_vocab_factor, max_token_len)
+    vocab = make_initial_vocab(
+        logger,
+        pretokens,
+        required_tokens,
+        vocab_size * initial_vocab_factor,
+        max_token_len,
+        algo=initial_vocab_algo,
+    )
     total_pretokens = sum(pretokens.values())
     total_bytes = sum(len(pretoken.encode()) * freq for pretoken, freq in pretokens.items())
     desired_vocab_size = int(vocab_size * pre_final_vocab_factor)
@@ -374,6 +375,9 @@ def train_unigram(
             logger.debug("   ├─ No defended tokens made it to the final vocabulary.")
     logger.debug("  📊 Compression Statistics:")
     logger.debug(f"   ├─ Total tokens: {stats['total_tokens']:,d}")
+    logger.debug(f"   ├─ Total pretokens: {total_pretokens:,d}")
+    logger.debug(f"   ├─ Total bytes: {total_bytes:,d}")
+    logger.debug(f"   ├─ Avg bytes/token: {stats['bytes/token']:.4f}")
     logger.debug(f"   └─ Avg tokens/pretoken: {stats['tokens/pretoken']:.4f}")
 
     return model, stats

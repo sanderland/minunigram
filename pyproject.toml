@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "datasets>=2.15.0",
     "numpy>=2.2.6",
+    "pydivsufsort>=0.0.18",
     "pyqt6>=6.9.1",
     "regex>=2024.11.6",
     "scipy>=1.15.3",

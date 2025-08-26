@@ -4,7 +4,7 @@ from collections.abc import Iterable
 import regex as re
 
 GPT2_PRE_TOKENIZER_REGEX = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-
+SPACES_PRE_TOKENIZER_REGEX = r" ?\p{L}+|\s+|[^\s\p{L}]+"
 
 def pretokenize_corpus(corpus: Iterable[str], regex_pattern: str = GPT2_PRE_TOKENIZER_REGEX) -> dict[str, int]:
     """
